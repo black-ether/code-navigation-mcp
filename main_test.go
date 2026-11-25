@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,7 +37,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "unbalanced brackets; outline may be incomplete")
 	case "flood":
 		fmt.Fprintln(os.Stdout, "sample.ps1 (powershell, 502 lines)")
-		fmt.Fprint(os.Stdout, "  1 | "+strings.Repeat("資料", 50000))
+		fmt.Fprintln(os.Stdout, "  1 | A complete heading")
+		fmt.Fprint(os.Stdout, "  2 | "+strings.Repeat("資料", 50000))
 	case "sleep":
 		time.Sleep(10 * time.Second)
 	default:
@@ -115,14 +117,14 @@ func TestToolRegistration(t *testing.T) {
 	for _, family := range []string{"both", "codecore", "codegos"} {
 		t.Run(family, func(t *testing.T) {
 			cfg := testConfig(t)
-			want := []string{"codecore_outline", "codegos_expand", "codegos_outline", "codegos_read"}
+			want := []string{"codecore_outline", "codecore_search", "codegos_expand", "codegos_outline", "codegos_read"}
 			switch family {
 			case "codecore":
 				cfg.codegos = ""
-				want = want[:1]
+				want = want[:2]
 			case "codegos":
 				cfg.codecore = ""
-				want = want[1:]
+				want = want[2:]
 			}
 			res, err := sessionFor(t, cfg).ListTools(context.Background(), nil)
 			if err != nil {
@@ -155,8 +157,11 @@ func TestCommandArguments(t *testing.T) {
 		args map[string]any
 		want []string
 	}{
-		{"codecore_outline", map[string]any{"path": name}, []string{"--depth", "0", "--", path}},
-		{"codecore_outline", map[string]any{"path": ".", "depth": 2}, []string{"--depth", "2", "--", cfg.workspace}},
+		{"codecore_outline", map[string]any{"path": name}, []string{"--", name}},
+		{"codecore_outline", map[string]any{"path": ".", "depth": 2}, []string{"--depth", "2", "--", "."}},
+		{"codecore_search", map[string]any{"path": name, "query": "config"}, []string{"--ask", "config", "--top", "5", "--", name}},
+		{"codecore_search", map[string]any{"path": path, "query": "--pattern & config", "limit": 2, "def_only": true, "per_file": true, "word": true, "no_tests": true},
+			[]string{"--ask", "--pattern & config", "--top", "2", "--def-only", "--per-file", "--word", "--no-tests", "--", name}},
 		{"codegos_outline", map[string]any{"path": path}, []string{path, "--plain"}},
 		{"codegos_expand", map[string]any{"path": name, "line": 5}, []string{path, "go", "5", "--plain"}},
 		{"codegos_read", map[string]any{"path": name, "start": 5, "end": 104}, []string{path, "show", "5-104", "--plain"}},
@@ -181,6 +186,11 @@ func TestInputValidation(t *testing.T) {
 		{"codecore_outline", map[string]any{"path": ".", "depth": -1}},
 		{"codecore_outline", map[string]any{"path": ".", "depth": 5}},
 		{"codecore_outline", map[string]any{"path": ".", "depth": "2"}},
+		{"codecore_search", map[string]any{"path": ".", "query": " "}},
+		{"codecore_search", map[string]any{"path": "."}},
+		{"codecore_search", map[string]any{"path": ".", "query": "config", "limit": 0}},
+		{"codecore_search", map[string]any{"path": ".", "query": "config", "limit": 51}},
+		{"codecore_search", map[string]any{"path": ".", "query": "config", "pattern": "func _"}},
 		{"codegos_outline", map[string]any{}},
 		{"codegos_outline", map[string]any{"path": " "}},
 		{"codegos_outline", map[string]any{"path": "."}},
@@ -231,12 +241,24 @@ func TestExecutablePathsAndConfig(t *testing.T) {
 		}
 	}
 	for _, extra := range [][]string{
-		{"--tools", "unknown"}, {"--max-output-bytes", "255"}, {"--max-read-lines", "0"}, {"--timeout", "0s"}, {"--codegos", filepath.Join(dir, "absent.exe")},
+		{"--tools", "unknown"}, {"--max-output-bytes", "255"}, {"--max-read-lines", "0"}, {"--max-search-results", "0"}, {"--timeout", "0s"}, {"--codegos", filepath.Join(dir, "absent.exe")},
 	} {
 		args := []string{"--workspace", dir, "--tools", "codegos", "--codegos", path}
 		if _, err := parseConfig(append(args, extra...), io.Discard); err == nil {
 			t.Errorf("accepted invalid configuration %v", extra)
 		}
+	}
+}
+
+func TestRejectsIncompatibleCLIs(t *testing.T) {
+	t.Setenv(mockMode, "ok")
+	cfg := testConfig(t)
+	if err := cfg.verifyCompatibility(); err == nil || !strings.Contains(err.Error(), "incompatible Codecore") {
+		t.Fatalf("missing Codecore compatibility diagnostic: %v", err)
+	}
+	cfg.codecore = ""
+	if err := cfg.verifyCompatibility(); err == nil || !strings.Contains(err.Error(), "incompatible Codegos") {
+		t.Fatalf("missing Codegos compatibility diagnostic: %v", err)
 	}
 }
 
@@ -252,8 +274,12 @@ func TestWorkspaceBoundaries(t *testing.T) {
 			t.Errorf("expected boundary error for %q, got %v", path, err)
 		}
 	}
+	nested := filepath.Join(cfg.workspace, "src", "nested")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
 	t.Run("links", func(t *testing.T) {
-		link := filepath.Join(cfg.workspace, "linked.go")
+		link := filepath.Join(nested, "linked.go")
 		if err := os.Symlink(outside, link); err != nil {
 			t.Skipf("file symlinks unavailable: %v", err)
 		}
@@ -266,23 +292,43 @@ func TestWorkspaceBoundaries(t *testing.T) {
 	})
 	if runtime.GOOS == "windows" {
 		t.Run("junction", func(t *testing.T) {
-			junction := filepath.Join(cfg.workspace, "outside-junction")
-			cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-				"New-Item -ErrorAction Stop -ItemType Junction -Path $env:CODE_NAV_TEST_JUNCTION -Target $env:CODE_NAV_TEST_JUNCTION_TARGET | Out-Null")
-			cmd.Env = append(os.Environ(), "CODE_NAV_TEST_JUNCTION="+junction, "CODE_NAV_TEST_JUNCTION_TARGET="+filepath.Dir(outside))
-			if output, err := cmd.CombinedOutput(); err != nil {
-				t.Skipf("junction creation unavailable: %v\n%s", err, output)
-			}
-			// Remove just the junction before the temporary directories are cleaned up.
-			t.Cleanup(func() {
-				if err := os.Remove(junction); err != nil {
-					t.Error(err)
-				}
-			})
+			junction := filepath.Join(nested, "outside-junction")
+			createJunction(t, junction, filepath.Dir(outside))
 			if _, err := cfg.sourcePath(context.Background(), filepath.Join(junction, filepath.Base(outside)), false); err == nil {
 				t.Fatal("followed a junction outside the workspace")
 			}
 		})
+	}
+}
+
+func createJunction(t *testing.T, junction, target string) {
+	t.Helper()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+		"New-Item -ErrorAction Stop -ItemType Junction -Path $env:CODE_NAV_TEST_JUNCTION -Target $env:CODE_NAV_TEST_JUNCTION_TARGET | Out-Null")
+	cmd.Env = append(os.Environ(), "CODE_NAV_TEST_JUNCTION="+junction, "CODE_NAV_TEST_JUNCTION_TARGET="+target)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("junction creation unavailable: %v\n%s", err, output)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(junction); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func TestNestedSpecialFile(t *testing.T) {
+	cfg := testConfig(t)
+	nested := filepath.Join(cfg.workspace, "src", "nested")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	socket, err := net.Listen("unix", filepath.Join(nested, "unsafe.go"))
+	if err != nil {
+		t.Skipf("filesystem sockets unavailable: %v", err)
+	}
+	defer socket.Close()
+	if _, err := cfg.sourcePath(context.Background(), ".", true); err == nil || !strings.Contains(err.Error(), "unsafe.go") {
+		t.Fatalf("nested special entry was not rejected: %v", err)
 	}
 }
 
@@ -300,7 +346,7 @@ func TestSubprocessResults(t *testing.T) {
 		{"empty", false, []string{"No outline rows"}},
 		{"unsupported", true, []string{"exit status 2", "unsupported file extension"}},
 		{"warning", false, []string{"[L:2] func f() {\n", "unbalanced brackets"}},
-		{"flood", false, []string{"  1 | ", "Result incomplete", "Use codegos_read"}},
+		{"flood", false, []string{"  1 | A complete heading\n[Result incomplete", "Use codegos_read"}},
 	} {
 		t.Run(tt.mode, func(t *testing.T) {
 			t.Setenv(mockMode, tt.mode)
@@ -336,29 +382,59 @@ func TestRealCLIsOverStdio(t *testing.T) {
 		t.Skip("set CODE_NAV_MCP_BIN, CODE_NAV_CORE_BIN, and CODE_NAV_GOS_BIN")
 	}
 	cfg := testConfig(t)
+	cfg.workspace = filepath.Join(cfg.workspace, "test", "project")
+	if err := os.MkdirAll(cfg.workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sessionWithLimits := func(flags ...string) *mcp.ClientSession {
+		t.Helper()
+		args := []string{"--workspace", cfg.workspace, "--codecore", core, "--codegos", gos}
+		return connect(t, &mcp.CommandTransport{Command: exec.Command(adapter, append(args, flags...)...)})
+	}
 	source := "package main\n\n// Workflow\nfunc main() {\n\t// Read config\n\tprintln(1)\n\t// Validate config\n\tprintln(2)\n}\n"
-	path := createFile(t, filepath.Join(cfg.workspace, "source with spaces.go"), source)
+	name := "source with spaces.go"
+	path := createFile(t, filepath.Join(cfg.workspace, name), source)
 	createFile(t, filepath.Join(cfg.workspace, "another.go"), "package main\n")
-	session := connect(t, &mcp.CommandTransport{Command: exec.Command(adapter,
-		"--workspace", cfg.workspace, "--codecore", core, "--codegos", gos,
-	)})
+	nested := filepath.Join(cfg.workspace, "src", "nested")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	createFile(t, filepath.Join(nested, "config.go"), "package nested\n// Orthogonal marker\nfunc validateConfig() int {\n\treturn 42\n}\nfunc config() {\n\tvalidateConfig()\n}\n")
+	createFile(t, filepath.Join(nested, "config_test.go"), "package nested\nfunc configTest() {\n\tvalidateConfig()\n}\n")
+	createFile(t, filepath.Join(cfg.workspace, "wrapped.html"), "<html>\n  <body>\n    <article>content</article>\n  </body>\n</html>\n")
+	session := sessionWithLimits()
+	direct := func(binary string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = cfg.workspace
+		want, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("direct CLI failed: %v", err)
+		}
+		return string(want)
+	}
 	for _, tt := range []struct {
 		tool, binary string
 		args         map[string]any
 		cliArgs      []string
 	}{
-		{"codecore_outline", core, map[string]any{"path": path, "depth": 1}, []string{"--depth", "1", path}},
-		{"codecore_outline", core, map[string]any{"path": "."}, []string{cfg.workspace}},
+		{"codecore_outline", core, map[string]any{"path": path, "depth": 1}, []string{"--depth", "1", name}},
+		{"codecore_outline", core, map[string]any{"path": "."}, []string{"."}},
+		{"codecore_outline", core, map[string]any{"path": "wrapped.html"}, []string{"wrapped.html"}},
+		{"codecore_outline", core, map[string]any{"path": "wrapped.html", "depth": 0}, []string{"--depth", "0", "wrapped.html"}},
+		{"codecore_search", core, map[string]any{"path": ".", "query": "config"}, []string{"--ask", "config", "--top", "5", "."}},
+		{"codecore_search", core, map[string]any{"path": ".", "query": "config", "limit": 1}, []string{"--ask", "config", "--top", "1", "."}},
+		{"codecore_search", core, map[string]any{"path": ".", "query": "config", "no_tests": true}, []string{"--ask", "config", "--no-tests", "."}},
+		{"codecore_search", core, map[string]any{"path": ".", "query": "config", "def_only": true, "per_file": true, "word": true},
+			[]string{"--ask", "config", "--def-only", "--per-file", "--word", "."}},
+		{"codecore_search", core, map[string]any{"path": "src", "query": "orthogonal", "word": true}, []string{"--ask", "orthogonal", "--word", "src"}},
 		{"codegos_outline", gos, map[string]any{"path": path}, []string{path, "--plain"}},
 		{"codegos_expand", gos, map[string]any{"path": path, "line": 3}, []string{path, "go", "3", "--plain"}},
 		{"codegos_expand", gos, map[string]any{"path": path, "line": 5}, []string{path, "go", "5", "--plain"}},
 		{"codegos_read", gos, map[string]any{"path": path, "start": 4, "end": 7}, []string{path, "show", "4-7", "--plain"}},
 	} {
-		want, err := exec.Command(tt.binary, tt.cliArgs...).Output()
-		if err != nil {
-			t.Fatalf("direct CLI failed: %v", err)
-		}
-		if got, failed := call(t, session, tt.tool, tt.args); failed || got != string(want) {
+		want := direct(tt.binary, tt.cliArgs...)
+		if got, failed := call(t, session, tt.tool, tt.args); failed || got != want {
 			t.Errorf("%s = %q, want %q", tt.tool, got, want)
 		}
 	}
@@ -375,5 +451,64 @@ func TestRealCLIsOverStdio(t *testing.T) {
 	}
 	if got, failed := call(t, session, "codegos_read", map[string]any{"path": path, "start": 8, "end": 10}); !failed || !strings.Contains(got, "exceeds file length") {
 		t.Errorf("range past EOF: %q", got)
+	}
+	if got, failed := call(t, session, "codecore_outline", map[string]any{"path": "."}); failed || !strings.Contains(got, filepath.Join("src", "nested", "config.go")) {
+		t.Errorf("recursive outline is missing a nested file: %q", got)
+	}
+	if got, failed := call(t, session, "codecore_search", map[string]any{"path": "src", "query": "orthogonal"}); failed || !strings.Contains(got, "config.go [L:3-4]") {
+		t.Errorf("ranked search is missing the attached-comment hit: %q", got)
+	}
+	if got, failed := call(t, session, "codecore_search", map[string]any{"path": ".", "query": "config", "no_tests": true}); failed || !strings.Contains(got, "config.go") || strings.Contains(got, "config_test.go") {
+		t.Errorf("no_tests did not filter only in-workspace test paths: %q", got)
+	}
+	if got, failed := call(t, session, "codecore_search", map[string]any{"path": ".", "query": "the"}); !failed || !strings.Contains(got, "searchable term") {
+		t.Errorf("stopword-only query: %q", got)
+	}
+
+	bounded := sessionWithLimits("--max-search-results", "2")
+	search := map[string]any{"path": ".", "query": "config"}
+	if got, failed := call(t, bounded, "codecore_search", search); failed || strings.Count(got, "\n     score ") != 2 || got != direct(core, "--ask", "config", "--top", "2", ".") {
+		t.Errorf("default search limit above configured cap: %q", got)
+	}
+	search["limit"] = 3
+	if got, failed := call(t, bounded, "codecore_search", search); !failed || !strings.Contains(got, "between 1 and 2") {
+		t.Errorf("search accepted limit above configured cap: %q", got)
+	}
+	clipped := sessionWithLimits("--max-output-bytes", "256")
+	delete(search, "limit")
+	got, failed := call(t, clipped, "codecore_search", search)
+	prefix, _, incomplete := strings.Cut(got, "[Result incomplete.")
+	want := direct(core, "--ask", "config", ".")
+	if failed || !incomplete || len(got) > 256 || !strings.HasSuffix(prefix, "\n") || !strings.HasPrefix(want, prefix) {
+		t.Errorf("search clipping did not retain complete CLI rows: %q", got)
+	}
+
+	outside := createFile(t, filepath.Join(t.TempDir(), "outside.go"), "package outside\nfunc privateOutside() {}\n")
+	assertBlocked := func(t *testing.T, basename string) {
+		t.Helper()
+		for _, tool := range []string{"codecore_outline", "codecore_search"} {
+			args := map[string]any{"path": "."}
+			if tool == "codecore_search" {
+				args["query"] = "privateOutside"
+			}
+			got, failed := call(t, session, tool, args)
+			if !failed || !strings.Contains(got, basename) || !strings.Contains(got, "linked or special entry") {
+				t.Errorf("%s failed to reject nested unsafe entry: %q", tool, got)
+			}
+		}
+	}
+	t.Run("nested link", func(t *testing.T) {
+		link := filepath.Join(nested, "linked.go")
+		if err := os.Symlink(outside, link); err != nil {
+			t.Skipf("file symlinks unavailable: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Remove(link) })
+		assertBlocked(t, "linked.go")
+	})
+	if runtime.GOOS == "windows" {
+		t.Run("nested junction", func(t *testing.T) {
+			createJunction(t, filepath.Join(nested, "outside-junction"), filepath.Dir(outside))
+			assertBlocked(t, "outside-junction")
+		})
 	}
 }

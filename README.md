@@ -4,14 +4,24 @@ A local stdio MCP server that runs Codecore and Codegos as subprocesses. MCP cli
 
 | MCP tool | Arguments | Equivalent CLI |
 | --- | --- | --- |
-| `codecore_outline` | `path`, optional `depth` from 0 to 4 (default 0) | `codecore --depth N -- PATH` |
+| `codecore_outline` | `path`, optional `depth` from 0 to 4 | `codecore [--depth N] -- PATH` |
+| `codecore_search` | `path`, `query`, optional `limit`, `def_only`, `per_file`, `word`, `no_tests` | `codecore --ask QUERY --top N [--def-only] [--per-file] [--word] [--no-tests] -- PATH` |
 | `codegos_outline` | `path` | `codegos PATH --plain` |
 | `codegos_expand` | `path`, `line` at the start of a heading | `codegos PATH go LINE --plain` |
 | `codegos_read` | `path`, inclusive `start` and `end`, both 1-based | `codegos PATH show START-END --plain` |
 
-Codecore outlines supported files in one directory level. Use a single file for deeper inspection. Codecore's text format gives line anchors and nesting. Codegos outlines give comment and block spans. A file without standalone comments yields just the compact file header. Codegos comment navigation supports Go, Python, and PowerShell. For other text files, use `codegos_read` for exact line ranges. Expansion preserves Codegos's own child listings and short leaf previews. Explicit reads preserve source indentation, blank lines, and line numbers.
+Codecore outlines and searches supported files recursively when given a directory. Outlines give line anchors and nesting. Ranked search uses the CLI's ranking and preserves file paths, ranges, scores, and enclosing blocks. Prefer a symbol or short topic for the query. The default hit count is 5, or the configured search cap if lower. All filters default to off. Set `def_only` for definitions, `per_file` for the best hit per file, `word` for whole-word matching, or `no_tests` to exclude test code. Both Codecore tools pass canonical workspace-relative paths to the CLI, so the workspace's parent directories cannot affect `no_tests`.
 
-The inspected Codecore source at `8856f93` and the matching installed binary have no ranked search command. Ranked search and a search-result limit are therefore unavailable in this version. [Codecore](https://github.com/black-ether/codecore) · [Codegos](https://github.com/black-ether/codegos)
+Codegos outlines give comment and block spans. A file without standalone comments yields just the compact file header. Codegos comment navigation supports Go, Python, and PowerShell. For other text files, use `codegos_read` for exact line ranges. Expansion preserves Codegos's child listings and short leaf previews. Explicit reads preserve source indentation, blank lines, and line numbers.
+
+## CLI compatibility
+
+- **Codecore** — Use experiment revision `26b8bdecaba0531c5b84746761bab214bb457a64`. This build includes recursive traversal, ranked search, and matches on attached comments and Python docstrings. Omit `depth` to use the CLI's default per language (2 for HTML/XML, 0 for most others). An explicit `0` stays top-level. The original adapter's Codecore revision `8856f93` fails the startup check. Token-pattern search, filename-only output, and counts are CLI-only options. [Codecore revision](https://github.com/black-ether/codecore/tree/26b8bdecaba0531c5b84746761bab214bb457a64)
+- **Codegos** — Use `bc789ba8aa4dde67067acbabb19f2da0b52741ef` for a reproducible build. The MCP contract requires compact `--plain` outlines, progressive expansion, and numbered `show` reads. Unrestricted `--full` remains a CLI-only option. [Codegos revision](https://github.com/black-ether/codegos/tree/bc789ba8aa4dde67067acbabb19f2da0b52741ef)
+
+Startup checks the enabled executables against a temporary fixture. Codecore must demonstrate recursive outlines and ranked search with comment matches and the supported flags. Codegos must demonstrate all three formats of navigation. A failed check identifies the executable and exits before serving MCP. For benchmark reproducibility, check the binaries with `go version -m` and pin their build revisions separately. A successful probe checks the CLI contract and permits other compatible builds.
+
+Windows stdio parity was checked against a clean build of Codecore at the revision above. Codegos parity was checked with the clean `bc789ba` build, the locally installed `bc789ba+dirty` build, and the older checkout binary at `3ee52ca3e24b25462e149f4d4dce5c694d1f546a+dirty`. Both older or locally modified Codegos builds matched the tested behavior. Use the clean pinned builds for new runs.
 
 ## Configuration and bounds
 
@@ -23,11 +33,12 @@ The inspected Codecore source at `8856f93` and the matching installed binary hav
 | `--codegos PATH` | `codegos` on PATH | Use an explicit executable path when the client has a different PATH. |
 | `--max-output-bytes N` | `8192` | UTF-8 tool text budget in bytes, minimum 256. MCP framing is additional. |
 | `--max-read-lines N` | `100` | Maximum inclusive size of one explicit source read. |
+| `--max-search-results N` | `50` | Maximum value of the search tool's `limit`. Codecore still returns fewer hits when applicable. |
 | `--timeout DURATION` | `5s` | Per-call deadline. Use Go durations such as `2s` or `500ms`. |
 
-The adapter captures each CLI stream within the configured byte budget and returns CLI text unchanged when it fits and contains valid UTF-8. It appends successful CLI warnings, supplies a short message for empty stdout, and returns CLI failures as MCP tool errors. Oversized text retains its leading anchors, may end in a partial row, and includes an incomplete-result notice with a narrower follow-up. A timeout returns a tool error. Neither CLI's JSON mode nor Codegos's `--full` is exposed.
+The adapter captures each CLI stream within the configured byte budget and returns CLI text unchanged when it fits and contains valid UTF-8. It appends successful CLI warnings, supplies a short message for empty stdout, and returns CLI failures as MCP tool errors. Oversized text retains leading complete rows and adds an incomplete-result notice with a narrower follow-up. If the first row alone is too long, its leading text is retained. A timeout returns a tool error.
 
-Executable and workspace settings belong to the local operator. Select the intended repository as the workspace. The adapter checks lexical and resolved paths, rejects symlinks and junctions that resolve outside the workspace, and rejects indirect or special file entries during directory outlining. It runs the configured binaries directly with argument arrays. The CLIs reopen files by path after validation, so the workspace and its parent directories must be trusted against concurrent path replacement. The deadline covers subprocess execution and is checked during directory enumeration. An OS filesystem call that blocks can still delay path validation.
+Executable and workspace settings belong to the local operator. Select the intended repository as the workspace. For individual paths, the adapter checks the resolved location against the workspace. Before a Codecore directory outline or search, it checks all descendants and rejects symlinks, junctions, and special entries, including in directories the CLI would skip. Use a narrower path if that check rejects a repository-wide call. The CLIs reopen paths after validation, so the workspace and its parent directories must be trusted against concurrent path replacement. The deadline covers subprocess execution and is checked during directory enumeration. A blocking filesystem call can delay validation.
 
 ## Build and test
 
@@ -88,27 +99,29 @@ mcp_servers:
 
 Use the Linux example within a WSL-based Hermes installation. [Native Windows guide](https://hermes-agent.nousresearch.com/docs/user-guide/windows-native) · [Hermes MCP guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)
 
-## Transfer to Muse's Ubuntu VM
+## Install on Muse's Ubuntu VM
 
-1. From this project directory on Windows, replace `USER@HOST` with the SSH login for the VM and transfer the Linux adapter.
-
-   ```powershell
-   ssh USER@HOST 'mkdir -p ~/code-navigation-bin'
-   scp dist/code-navigation-mcp-linux-amd64 USER@HOST:code-navigation-bin/code-navigation-mcp
-   ```
-
-2. On the VM, prepare the three Linux executables. Reuse existing Codecore and Codegos binaries if they match the inspected syntax. If you need source checkouts, clone Codecore at `8856f93` and Codegos at `bc789ba`. Use Go 1.27 or newer to build both and adjust the checkout locations below. [Codecore](https://github.com/black-ether/codecore) · [Codegos](https://github.com/black-ether/codegos)
+1. On the VM, clone over outbound HTTPS and build with Go 1.27 or newer. The first adapter build downloads Go modules.
 
    ```bash
-   chmod +x "$HOME/code-navigation-bin/code-navigation-mcp"
+   mkdir -p "$HOME/src" "$HOME/code-navigation-bin"
+   git clone https://github.com/black-ether/codecore.git "$HOME/src/codecore"
+   git clone https://github.com/black-ether/codegos.git "$HOME/src/Codegos"
+   git clone https://github.com/black-ether/code-navigation-mcp.git "$HOME/src/code-navigation-mcp"
+   git -C "$HOME/src/codecore" switch --detach 26b8bdecaba0531c5b84746761bab214bb457a64
+   git -C "$HOME/src/Codegos" switch --detach bc789ba8aa4dde67067acbabb19f2da0b52741ef
    (cd "$HOME/src/codecore" && CGO_ENABLED=0 go build -trimpath -o "$HOME/code-navigation-bin/codecore" .)
    (cd "$HOME/src/Codegos" && CGO_ENABLED=0 go build -trimpath -o "$HOME/code-navigation-bin/codegos" .)
-   "$HOME/code-navigation-bin/code-navigation-mcp" --help
-   "$HOME/code-navigation-bin/codecore" --help
-   "$HOME/code-navigation-bin/codegos" --help
+   (cd "$HOME/src/code-navigation-mcp" && CGO_ENABLED=0 go build -trimpath -o "$HOME/code-navigation-bin/code-navigation-mcp" .)
+   go version -m "$HOME/code-navigation-bin/codecore" "$HOME/code-navigation-bin/codegos"
+   (cd "$HOME/src/code-navigation-mcp" &&
+     CODE_NAV_MCP_BIN="$HOME/code-navigation-bin/code-navigation-mcp" \
+     CODE_NAV_CORE_BIN="$HOME/code-navigation-bin/codecore" \
+     CODE_NAV_GOS_BIN="$HOME/code-navigation-bin/codegos" \
+     go test -count=1 ./...)
    ```
 
-3. Open `hermes -p PROFILE config edit`, where `PROFILE` is Muse's experiment profile. Use `default` if Muse runs the default profile. Merge the following into the existing `mcp_servers` map. Replace `/home/muse` with the actual absolute home and select the target workspace.
+2. Open `hermes -p PROFILE config edit`, where `PROFILE` is Muse's experiment profile. Use `default` if Muse runs the default profile. Merge the following into the existing `mcp_servers` map. Replace `/home/muse` with the actual absolute home and select the target workspace.
 
    ```yaml
    mcp_servers:
@@ -125,7 +138,7 @@ Use the Linux example within a WSL-based Hermes installation. [Native Windows gu
          - both
    ```
 
-4. Run `hermes -p PROFILE mcp list` to list configured servers and `hermes -p PROFILE mcp test code_navigation` to connect and discover the four tools without a model call. Start a fresh Hermes session for the profile or use `/reload-mcp` in a running session.
+3. Run `hermes -p PROFILE mcp list` to list configured servers and `hermes -p PROFILE mcp test code_navigation` to connect and discover the five tools without a model call. Start a fresh Hermes session for the profile or use `/reload-mcp` in a running session.
 
 For a Codecore-only or Codegos-only condition, change the `--tools` value to `codecore` or `codegos` in that profile. Hermes also supports a per-server `tools.include` list of MCP tool names. Use `enabled: false` to disable the server, or remove the entry. These commands apply to Windows and Linux. [Hermes MCP configuration reference](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference) · [Hermes profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles)
 
@@ -142,6 +155,17 @@ Set the workspace to the Codegos checkout to use its `examples/sample.ps1` fixtu
 [L:7]  $config = Get-Content config.json
 [L:9]  if (!$config) { throw 'Missing config' }
 [L:12] Start-Process app.exe
+```
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"codecore_search","arguments":{"path":"examples/sample.ps1","query":"config","limit":2,"word":true}}}
+```
+
+```text
+  1. examples/sample.ps1 [L:7] $config = Get-Content config.json
+     score 4.14
+  2. examples/sample.ps1 [L:9] if (!$config) { throw 'Missing config' }
+     score 3.98
 ```
 
 ```json

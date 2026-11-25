@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,32 +70,23 @@ func (cfg config) sourcePath(ctx context.Context, path string, allowDirectory bo
 	return resolved, nil
 }
 
-// Codecore inspects immediate directory entries itself. Reject indirect and
-// special entries before giving it a directory, without duplicating its
-// language-extension list.
+// Codecore enumerates files recursively and opens matching paths later.
+// Reject unsafe entries at every depth before invoking it.
 func checkDirectory(ctx context.Context, path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open source directory: %w", err)
-	}
-	defer dir.Close()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		entries, err := dir.ReadDir(128)
-		for _, entry := range entries {
-			if !entry.IsDir() && !entry.Type().IsRegular() {
-				return fmt.Errorf("directory contains a linked or special entry %q; select a single source file", entry.Name())
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
+	return filepath.WalkDir(path, func(item string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return fmt.Errorf("inspect source directory: %w", err)
 		}
-	}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		kind := entry.Type()
+		if !kind.IsRegular() && kind != fs.ModeDir {
+			rel, _ := filepath.Rel(path, item)
+			return fmt.Errorf("directory contains a linked or special entry %q; use a narrower path", rel)
+		}
+		return nil
+	})
 }
 
 func (cfg config) run(ctx context.Context, binary, path string, allowDirectory bool, narrow string, arguments func(string) []string) (*mcp.CallToolResult, error) {
@@ -108,6 +99,14 @@ func (cfg config) run(ctx context.Context, binary, path string, allowDirectory b
 	}
 	if ctx.Err() != nil {
 		return cfg.interrupted(ctx.Err(), narrow)
+	}
+	if allowDirectory {
+		// Codecore's --no-tests checks all path components. Give it a path
+		// relative to the workspace so only in-workspace names affect it.
+		resolved, err = workspaceRelative(cfg.workspace, resolved)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, binary, arguments(resolved)...)
@@ -179,9 +178,10 @@ func limitText(s string, limit int, narrow string, incomplete bool) string {
 	}
 	note := "[Result incomplete. Output limit reached. " + narrow + "]"
 	budget := limit - len(note) - 1
-	prefix := strings.ToValidUTF8(s[:min(len(s), budget)], "?")
-	if strings.HasSuffix(prefix, "\n") {
+	prefix := s[:min(len(s), budget)]
+	if last := strings.LastIndexByte(prefix, '\n'); last >= 0 {
+		prefix = strings.ToValidUTF8(prefix[:last+1], "?")
 		return prefix + note
 	}
-	return prefix + "\n" + note
+	return strings.ToValidUTF8(prefix, "?") + "\n" + note
 }

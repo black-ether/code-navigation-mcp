@@ -19,6 +19,8 @@ import (
 const (
 	defaultOutputBytes = 8192
 	defaultReadLines   = 100
+	defaultSearchLimit = 5
+	defaultMaxSearch   = 50
 	defaultTimeout     = 5 * time.Second
 	maxDepth           = 4
 )
@@ -27,6 +29,7 @@ type config struct {
 	workspace, codecore, codegos string
 	workspaceInfo                os.FileInfo
 	maxOutputBytes, maxReadLines int
+	maxSearchResults             int
 	timeout                      time.Duration
 }
 
@@ -41,6 +44,7 @@ func parseConfig(args []string, diagnostics io.Writer) (config, error) {
 	flags.StringVar(&gos, "codegos", "codegos", "Codegos executable path or PATH name")
 	flags.IntVar(&cfg.maxOutputBytes, "max-output-bytes", defaultOutputBytes, "maximum UTF-8 bytes per tool response (at least 256)")
 	flags.IntVar(&cfg.maxReadLines, "max-read-lines", defaultReadLines, "maximum inclusive line count per source read")
+	flags.IntVar(&cfg.maxSearchResults, "max-search-results", defaultMaxSearch, "maximum ranked hits per search")
 	flags.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "maximum duration per operation")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
@@ -53,6 +57,9 @@ func parseConfig(args []string, diagnostics io.Writer) (config, error) {
 	}
 	if cfg.maxOutputBytes < 256 || cfg.maxReadLines < 1 || cfg.timeout <= 0 {
 		return cfg, fmt.Errorf("choose --max-output-bytes >= 256, --max-read-lines >= 1, and --timeout > 0")
+	}
+	if cfg.maxSearchResults < 1 {
+		return cfg, fmt.Errorf("--max-search-results must be at least 1")
 	}
 	if families != "both" && families != "codecore" && families != "codegos" {
 		return cfg, fmt.Errorf("--tools must be codecore, codegos, or both")
@@ -121,6 +128,10 @@ func main() {
 		return
 	}
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "code-navigation-mcp:", err)
+		os.Exit(2)
+	}
+	if err := cfg.verifyCompatibility(); err != nil {
 		fmt.Fprintln(os.Stderr, "code-navigation-mcp:", err)
 		os.Exit(2)
 	}
